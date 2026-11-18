@@ -105,6 +105,16 @@ func (txn *Txn) writableIndex(table, index string) *iradix.Txn {
 }
 
 // Abort is used to cancel this transaction.
+//
+// Every mutation performed by the transaction is rolled back atomically:
+// inserts, updates, deletes and prefix deletes disappear from all indexes of
+// every touched table, and the values present when the transaction started are
+// restored unchanged. This relies on the immutable radix trees - each index
+// mutation is staged on a private copy-on-write transaction that is simply
+// discarded here, so no inverse writes are required and the commit path keeps
+// its single-pass index updates. Abort also issues no watch notifications
+// because the committed state never changes.
+//
 // This is a noop for read transactions,
 // already aborted or commited transactions.
 func (txn *Txn) Abort() {

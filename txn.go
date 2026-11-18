@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	iradix "github.com/hashicorp/go-immutable-radix"
@@ -20,6 +21,12 @@ const (
 var (
 	// ErrNotFound is returned when the requested item is not found
 	ErrNotFound = fmt.Errorf("not found")
+
+	// ErrTxnTimeout is returned by mutating operations on a write
+	// transaction that has exceeded the timeout configured with
+	// MemDB.SetWriteTxnTimeout. The transaction is aborted as a result,
+	// which releases the writer lock so other writers can proceed.
+	ErrTxnTimeout = fmt.Errorf("transaction timed out")
 )
 
 // tableIndex is a tuple of (Table, Index) used for lookups
@@ -35,12 +42,36 @@ type Txn struct {
 	write   bool
 	rootTxn *iradix.Txn
 	after   []func()
+	id      uint64
+	start   time.Time
 
 	// changes is used to track the changes performed during the transaction. If
 	// it is nil at transaction start then changes are not tracked.
 	changes Changes
 
 	modified map[tableIndex]*iradix.Txn
+}
+
+// ID returns the unique identifier of this transaction. The ID is assigned
+// when the transaction is created and matches the ID reported by
+// MemDB.ActiveTxns, which is useful for correlating logs and metrics.
+func (txn *Txn) ID() uint64 {
+	return txn.id
+}
+
+// checkTimeout aborts the transaction and returns ErrTxnTimeout if it is a
+// write transaction that has exceeded the timeout configured with
+// MemDB.SetWriteTxnTimeout. Read transactions are never timed out since
+// they hold no locks and cannot block writers.
+func (txn *Txn) checkTimeout() error {
+	if !txn.write || txn.rootTxn == nil {
+		return nil
+	}
+	if timeout := txn.db.WriteTxnTimeout(); timeout > 0 && time.Since(txn.start) > timeout {
+		txn.Abort()
+		return ErrTxnTimeout
+	}
+	return nil
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -108,8 +139,10 @@ func (txn *Txn) writableIndex(table, index string) *iradix.Txn {
 // This is a noop for read transactions,
 // already aborted or commited transactions.
 func (txn *Txn) Abort() {
-	// Noop for a read transaction
+	// For read transactions there is nothing to roll back, we only need
+	// to stop tracking the transaction.
 	if !txn.write {
+		txn.db.unregisterTxn(txn)
 		return
 	}
 
@@ -123,6 +156,9 @@ func (txn *Txn) Abort() {
 	txn.modified = nil
 	txn.changes = nil
 
+	// Stop tracking the transaction
+	txn.db.unregisterTxn(txn)
+
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
 }
@@ -130,14 +166,27 @@ func (txn *Txn) Abort() {
 // Commit is used to finalize this transaction.
 // This is a noop for read transactions,
 // already aborted or committed transactions.
+//
+// If the transaction has exceeded the timeout configured with
+// MemDB.SetWriteTxnTimeout, the transaction is aborted instead of being
+// committed and none of its changes become visible.
 func (txn *Txn) Commit() {
-	// Noop for a read transaction
+	// For read transactions there is nothing to commit, we only need to
+	// stop tracking the transaction.
 	if !txn.write {
+		txn.db.unregisterTxn(txn)
 		return
 	}
 
 	// Check if already aborted or committed
 	if txn.rootTxn == nil {
+		return
+	}
+
+	// A transaction that has exceeded the write timeout is aborted rather
+	// than committed so that a stalled writer cannot publish changes after
+	// holding the writer lock for too long.
+	if err := txn.checkTimeout(); err != nil {
 		return
 	}
 
@@ -165,6 +214,9 @@ func (txn *Txn) Commit() {
 	txn.rootTxn = nil
 	txn.modified = nil
 
+	// Stop tracking the transaction
+	txn.db.unregisterTxn(txn)
+
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
 
@@ -183,6 +235,9 @@ func (txn *Txn) Commit() {
 func (txn *Txn) Insert(table string, obj interface{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot insert in read-only transaction")
+	}
+	if err := txn.checkTimeout(); err != nil {
+		return err
 	}
 
 	// Get the table schema
@@ -308,6 +363,9 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot delete in read-only transaction")
 	}
+	if err := txn.checkTimeout(); err != nil {
+		return err
+	}
 
 	// Get the table schema
 	tableSchema, ok := txn.db.schema.Tables[table]
@@ -384,6 +442,9 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (bool, error) {
 	if !txn.write {
 		return false, fmt.Errorf("cannot delete in read-only transaction")
+	}
+	if err := txn.checkTimeout(); err != nil {
+		return false, err
 	}
 
 	if !strings.HasSuffix(prefix_index, "_prefix") {

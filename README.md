@@ -27,6 +27,13 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
+* Transaction Monitoring - Open transactions can be inspected via `ActiveTxns` and
+  `LongRunningTxns` to identify long-running transactions. Read transactions hold no
+  locks and never block writers, so long-running readers (reports, backups) are safe.
+  Write transactions hold the single writer lock and can be bounded with
+  `SetWriteTxnTimeout`: a timed-out write transaction is aborted and releases the
+  lock instead of stalling other writers.
+
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
 Documentation

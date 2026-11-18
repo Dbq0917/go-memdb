@@ -6,8 +6,10 @@
 package memdb
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/hashicorp/go-immutable-radix"
@@ -33,6 +35,16 @@ type MemDB struct {
 
 	// There can only be a single writer at once
 	writer sync.Mutex
+
+	// txns tracks all currently open transactions so that long-running
+	// transactions can be identified and inspected. Read transactions hold
+	// no locks and never block writers, so they are tracked purely for
+	// observability. Write transactions hold the writer lock, so they can
+	// additionally be bounded by a timeout.
+	txnsMu          sync.Mutex
+	txns            map[uint64]*Txn
+	lastTxn         uint64
+	writeTxnTimeout atomic.Int64 // nanoseconds, 0 means no timeout
 }
 
 // NewMemDB creates a new MemDB with the given schema.
@@ -79,8 +91,112 @@ func (db *MemDB) Txn(write bool) *Txn {
 		db:      db,
 		write:   write,
 		rootTxn: db.getRoot().Txn(),
+		start:   time.Now(),
 	}
+	db.registerTxn(txn)
 	return txn
+}
+
+// TxnInfo describes a transaction that is currently open against the
+// database. It is a point-in-time snapshot returned by ActiveTxns and
+// LongRunningTxns.
+type TxnInfo struct {
+	// ID uniquely identifies the transaction for the lifetime of the
+	// process. IDs are monotonically increasing.
+	ID uint64
+
+	// Write is true for write transactions. Write transactions hold the
+	// single writer lock and therefore block other writers.
+	Write bool
+
+	// Start is the time at which the transaction was created.
+	Start time.Time
+}
+
+// Age returns how long the transaction has been open.
+func (info TxnInfo) Age() time.Duration {
+	return time.Since(info.Start)
+}
+
+// ActiveTxns returns information about every transaction that is currently
+// open against the database, oldest first. This can be used to identify
+// long-running transactions, for example to drive metrics or logging.
+func (db *MemDB) ActiveTxns() []TxnInfo {
+	db.txnsMu.Lock()
+	defer db.txnsMu.Unlock()
+
+	infos := make([]TxnInfo, 0, len(db.txns))
+	for id, txn := range db.txns {
+		infos = append(infos, TxnInfo{
+			ID:    id,
+			Write: txn.write,
+			Start: txn.start,
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].Start.Before(infos[j].Start)
+	})
+	return infos
+}
+
+// LongRunningTxns returns information about every open transaction that has
+// been alive for at least minAge, oldest first. Since read transactions in
+// MemDB hold no locks and never block writers, a long-running read
+// transaction (such as a report or backup) is generally harmless and only
+// worth surfacing for observability. A long-running write transaction holds
+// the single writer lock and blocks all other writers; those can be bounded
+// with SetWriteTxnTimeout.
+func (db *MemDB) LongRunningTxns(minAge time.Duration) []TxnInfo {
+	var out []TxnInfo
+	for _, info := range db.ActiveTxns() {
+		if info.Age() >= minAge {
+			out = append(out, info)
+		}
+	}
+	return out
+}
+
+// SetWriteTxnTimeout bounds how long a write transaction may stay open.
+// Write transactions hold the single writer lock, so an unbounded write
+// transaction stalls all other writers. Once a write transaction exceeds
+// the timeout, the next mutating operation or Commit fails with
+// ErrTxnTimeout and the transaction is aborted, releasing the writer lock.
+//
+// The timeout does not apply to read transactions: they hold no locks, run
+// against an immutable snapshot, and never block writers, so long-running
+// readers (reports, backups) are allowed to run to completion.
+//
+// A zero or negative timeout disables the check, which is the default.
+func (db *MemDB) SetWriteTxnTimeout(timeout time.Duration) {
+	db.writeTxnTimeout.Store(int64(timeout))
+}
+
+// WriteTxnTimeout returns the currently configured write transaction
+// timeout. A zero value means no timeout is enforced.
+func (db *MemDB) WriteTxnTimeout() time.Duration {
+	return time.Duration(db.writeTxnTimeout.Load())
+}
+
+// registerTxn records an open transaction so it can be inspected via
+// ActiveTxns. The transaction is removed when it is committed or aborted.
+func (db *MemDB) registerTxn(txn *Txn) {
+	db.txnsMu.Lock()
+	defer db.txnsMu.Unlock()
+
+	if db.txns == nil {
+		db.txns = make(map[uint64]*Txn)
+	}
+	db.lastTxn++
+	txn.id = db.lastTxn
+	db.txns[txn.id] = txn
+}
+
+// unregisterTxn removes a transaction from the open transaction registry.
+func (db *MemDB) unregisterTxn(txn *Txn) {
+	db.txnsMu.Lock()
+	defer db.txnsMu.Unlock()
+
+	delete(db.txns, txn.id)
 }
 
 // Snapshot is used to capture a point-in-time snapshot  of the database that
@@ -95,6 +211,7 @@ func (db *MemDB) Snapshot() *MemDB {
 		root:    unsafe.Pointer(db.getRoot()),
 		primary: false,
 	}
+	clone.writeTxnTimeout.Store(db.writeTxnTimeout.Load())
 	return clone
 }
 

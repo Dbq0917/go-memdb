@@ -47,6 +47,13 @@ type TableSchema struct {
 	// is a unique name for the index and must match the Name in the
 	// IndexSchema.
 	Indexes map[string]*IndexSchema
+
+	// TTL, when non-nil, enables expiry for the table. Expiring objects must
+	// implement the Expirer interface. Read transactions transparently filter
+	// out expired objects, while PurgeExpired removes them physically in
+	// batches. A reserved internal index named ttlIndexName is installed
+	// automatically and must not be present in Indexes.
+	TTL *TTLConfig
 }
 
 // Validate is used to validate the table schema
@@ -69,6 +76,12 @@ func (s *TableSchema) Validate() error {
 
 	if _, ok := s.Indexes["id"].Indexer.(SingleIndexer); !ok {
 		return fmt.Errorf("id index must be a SingleIndexer")
+	}
+
+	if s.TTL != nil {
+		if _, conflict := s.Indexes[ttlIndexName]; conflict {
+			return fmt.Errorf("index name %q is reserved for TTL support", ttlIndexName)
+		}
 	}
 
 	for name, index := range s.Indexes {

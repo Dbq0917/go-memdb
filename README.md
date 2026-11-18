@@ -27,6 +27,10 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
+* Time to live - Tables can opt into expiry. Read transactions transparently filter expired
+  records on every lookup and iteration path, while a batched purge reclaims the physical entries
+  in the background without forcing short TTLs or extra write amplification.
+
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
 Documentation
@@ -143,3 +147,66 @@ for obj := it.Next(); obj != nil; obj = it.Next() {
 //   Joe is aged 30
 //   Lucy is aged 35
 ```
+
+Time to live
+============
+
+A table enables expiry by setting `TTL` in its schema. Rows then control their own lifetime by
+implementing the `Expirer` interface:
+
+```go
+type Session struct {
+	Token   string
+	Expires time.Time
+}
+
+// ExpiresAt implements memdb.Expirer. The zero time means the row never expires.
+func (s *Session) ExpiresAt() time.Time {
+	return s.Expires
+}
+
+schema := &memdb.DBSchema{
+	Tables: map[string]*memdb.TableSchema{
+		"session": {
+			Name: "session",
+			TTL:  &memdb.TTLConfig{},
+			Indexes: map[string]*memdb.IndexSchema{
+				"id": {
+					Name:    "id",
+					Unique:  true,
+					Indexer: &memdb.StringFieldIndex{Field: "Token"},
+				},
+			},
+		},
+	},
+}
+
+db, err := memdb.NewMemDB(schema)
+```
+
+Read paths (`Get`, `GetReverse`, `LowerBound`, `ReverseLowerBound`, `First`, `Last`,
+`LongestPrefix`) never return an expired row, even before any background cleanup has run. The
+read timestamp is captured once per transaction, so filtering costs a single integer comparison
+per row while physical cleanup is lagging and drops to zero once cleanup has caught up. Expired
+data is never mutated or eagerly deleted by a read; it is simply hidden.
+
+Physical reclamation is intentionally decoupled from reads and is driven in batches by a
+background job through `PurgeExpired`. The optional limit bounds how many rows each transaction
+touches, which keeps write amplification independent of the configured TTL length:
+
+```go
+ticker := time.NewTicker(time.Minute)
+go func() {
+	for range ticker.C {
+		txn := db.Txn(true)
+		if _, err := txn.PurgeExpired("session", 1024); err != nil {
+			txn.Abort()
+			continue
+		}
+		txn.Commit()
+	}
+}()
+```
+
+Rows that do not implement `Expirer`, or whose `ExpiresAt` returns the zero `time.Time`, are
+treated as permanent.

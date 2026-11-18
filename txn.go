@@ -41,6 +41,19 @@ type Txn struct {
 	changes Changes
 
 	modified map[tableIndex]*iradix.Txn
+
+	// now is the lazily evaluated read timestamp (unix nano) shared by every
+	// iterator and point lookup created from this transaction. Zero means it has
+	// not been evaluated yet.
+	now int64
+
+	// watermarkCache holds the immutable purge high-water mark map captured on
+	// first TTL access within this transaction.
+	watermarkCache map[string]int64
+
+	// purgeMarks records the new purge high-water marks established by calls to
+	// PurgeExpired. They are published to the MemDB when the transaction commits.
+	purgeMarks map[string]int64
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -122,6 +135,7 @@ func (txn *Txn) Abort() {
 	txn.rootTxn = nil
 	txn.modified = nil
 	txn.changes = nil
+	txn.purgeMarks = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -164,6 +178,9 @@ func (txn *Txn) Commit() {
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+
+	// Publish purge high-water marks only after the cleaned tree is visible.
+	txn.db.advanceWatermarks(txn.purgeMarks)
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -537,6 +554,7 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 	if err != nil {
 		return nil, nil, err
 	}
+	tableSchema := txn.db.schema.Tables[table]
 
 	// Get the index itself
 	indexTxn := txn.readableIndex(table, indexSchema.Name)
@@ -544,7 +562,7 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 	// Do an exact lookup
 	if indexSchema.Unique && val != nil && indexSchema.Name == index {
 		watch, obj, ok := indexTxn.GetWatch(val)
-		if !ok {
+		if !ok || (tableSchema.TTL != nil && txn.isExpired(obj)) {
 			return watch, nil, nil
 		}
 		return watch, obj, nil
@@ -553,8 +571,7 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 	// Handle non-unique index by using an iterator and getting the first value
 	iter := indexTxn.Root().Iterator()
 	watch := iter.SeekPrefixWatch(val)
-	_, value, _ := iter.Next()
-	return watch, value, nil
+	return watch, txn.firstAlive(tableSchema, &radixIterator{iter: iter}), nil
 }
 
 // LastWatch is used to return the last matching object for
@@ -577,6 +594,7 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 	if err != nil {
 		return nil, nil, err
 	}
+	tableSchema := txn.db.schema.Tables[table]
 
 	// Get the index itself
 	indexTxn := txn.readableIndex(table, indexSchema.Name)
@@ -584,7 +602,7 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 	// Do an exact lookup
 	if indexSchema.Unique && val != nil && indexSchema.Name == index {
 		watch, obj, ok := indexTxn.GetWatch(val)
-		if !ok {
+		if !ok || (tableSchema.TTL != nil && txn.isExpired(obj)) {
 			return watch, nil, nil
 		}
 		return watch, obj, nil
@@ -593,8 +611,20 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 	// Handle non-unique index by using an iterator and getting the last value
 	iter := indexTxn.Root().ReverseIterator()
 	watch := iter.SeekPrefixWatch(val)
-	_, value, _ := iter.Previous()
-	return watch, value, nil
+	return watch, txn.firstAlive(tableSchema, &radixReverseIterator{iter: iter}), nil
+}
+
+// firstAlive returns the first non-expired value produced by iter, or nil.
+func (txn *Txn) firstAlive(tableSchema *TableSchema, iter ResultIterator) interface{} {
+	if tableSchema.TTL == nil {
+		return iter.Next()
+	}
+	for {
+		value := iter.Next()
+		if value == nil || !txn.isExpired(value) {
+			return value
+		}
+	}
 }
 
 // First is used to return the first matching object for
@@ -638,6 +668,7 @@ func (txn *Txn) LongestPrefix(table, index string, args ...interface{}) (interfa
 	if err != nil {
 		return nil, err
 	}
+	tableSchema := txn.db.schema.Tables[table]
 
 	// This algorithm only makes sense against a unique index, otherwise the
 	// index keys will have the IDs appended to them.
@@ -648,6 +679,9 @@ func (txn *Txn) LongestPrefix(table, index string, args ...interface{}) (interfa
 	// Find the longest prefix match with the given index.
 	indexTxn := txn.readableIndex(table, indexSchema.Name)
 	if _, value, ok := indexTxn.Root().LongestPrefix(val); ok {
+		if tableSchema.TTL != nil && txn.isExpired(value) {
+			return nil, nil
+		}
 		return value, nil
 	}
 	return nil, nil
@@ -755,7 +789,7 @@ func (txn *Txn) Get(table, index string, args ...interface{}) (ResultIterator, e
 		iter:    indexIter,
 		watchCh: watchCh,
 	}
-	return iter, nil
+	return txn.wrapTTL(table, iter), nil
 }
 
 // GetReverse is used to construct a Reverse ResultIterator over all the
@@ -780,7 +814,7 @@ func (txn *Txn) GetReverse(table, index string, args ...interface{}) (ResultIter
 		iter:    indexIter,
 		watchCh: watchCh,
 	}
-	return iter, nil
+	return txn.wrapTTL(table, iter), nil
 }
 
 // LowerBound is used to construct a ResultIterator over all the the range of
@@ -809,7 +843,7 @@ func (txn *Txn) LowerBound(table, index string, args ...interface{}) (ResultIter
 	iter := &radixIterator{
 		iter: indexIter,
 	}
-	return iter, nil
+	return txn.wrapTTL(table, iter), nil
 }
 
 // ReverseLowerBound is used to construct a Reverse ResultIterator over all the
@@ -835,7 +869,7 @@ func (txn *Txn) ReverseLowerBound(table, index string, args ...interface{}) (Res
 	iter := &radixReverseIterator{
 		iter: indexIter,
 	}
-	return iter, nil
+	return txn.wrapTTL(table, iter), nil
 }
 
 // objectID is a tuple of table name and the raw internal id byte slice

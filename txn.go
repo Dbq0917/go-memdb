@@ -6,6 +6,7 @@ package memdb
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"unsafe"
@@ -783,6 +784,115 @@ func (txn *Txn) GetReverse(table, index string, args ...interface{}) (ResultIter
 	return iter, nil
 }
 
+// IndexQuery specifies a lookup against a single index of a table as part of
+// a multi-index query. Index and Args are interpreted exactly as they are
+// for Get, including support for the "_prefix" suffix on the index name.
+type IndexQuery struct {
+	Index string
+	Args  []interface{}
+}
+
+// GetMulti is used to construct a ResultIterator over the union of the rows
+// that match any of the given index queries on a table. It is equivalent to
+// calling Get once per query and merging the results, except that a row
+// matching more than one query is returned exactly once.
+//
+// Duplicates are detected using the table's "id" index. Only the id keys of
+// rows that have already been returned are tracked, so results are streamed
+// as they are found: the full result set is never materialized in memory and
+// no re-sorting is performed. This makes GetMulti suitable for paginated or
+// exported result sets where the total count must match the number of
+// distinct rows.
+//
+// Rows are returned grouped by query, in the order the queries were given,
+// with each group in index order. No global ordering across queries is
+// guaranteed.
+//
+// The WatchCh of the returned iterator fires when a mutation affects any of
+// the underlying queries.
+//
+// See the documentation for ResultIterator to understand the behaviour of the
+// returned ResultIterator.
+func (txn *Txn) GetMulti(table string, queries ...IndexQuery) (ResultIterator, error) {
+	if len(queries) == 0 {
+		return nil, fmt.Errorf("must specify at least one index query")
+	}
+
+	// Get the table schema
+	tableSchema, ok := txn.db.schema.Tables[table]
+	if !ok {
+		return nil, fmt.Errorf("invalid table '%s'", table)
+	}
+
+	// The id index is required on every table and is unique, so its key
+	// identifies a row for de-duplication.
+	idIndexer, ok := tableSchema.Indexes[id].Indexer.(SingleIndexer)
+	if !ok {
+		return nil, fmt.Errorf("id index for table '%s' must be a SingleIndexer", table)
+	}
+
+	// Build an iterator for each query up front so that the results reflect
+	// a consistent snapshot of the table, and so that argument errors are
+	// reported before iteration begins.
+	iters := make([]*iradix.Iterator, 0, len(queries))
+	watchChs := make([]<-chan struct{}, 0, len(queries))
+	for _, q := range queries {
+		indexIter, val, err := txn.getIndexIterator(table, q.Index, q.Args...)
+		if err != nil {
+			return nil, err
+		}
+
+		// Seek the iterator to the appropriate sub-set
+		watchCh := indexIter.SeekPrefixWatch(val)
+
+		iters = append(iters, indexIter)
+		watchChs = append(watchChs, watchCh)
+	}
+
+	return &multiIterator{
+		iters:     iters,
+		idIndexer: idIndexer,
+		seen:      make(map[string]struct{}),
+		watchCh:   mergeWatchChans(watchChs),
+	}, nil
+}
+
+// mergeWatchChans combines multiple watch channels into a single channel
+// that is closed when any of them fires. Duplicate and nil channels are
+// ignored. It returns nil if there are no channels to watch.
+func mergeWatchChans(chans []<-chan struct{}) <-chan struct{} {
+	seen := make(map[<-chan struct{}]struct{}, len(chans))
+	unique := make([]<-chan struct{}, 0, len(chans))
+	for _, ch := range chans {
+		if ch == nil {
+			continue
+		}
+		if _, ok := seen[ch]; ok {
+			continue
+		}
+		seen[ch] = struct{}{}
+		unique = append(unique, ch)
+	}
+
+	switch len(unique) {
+	case 0:
+		return nil
+	case 1:
+		return unique[0]
+	}
+
+	merged := make(chan struct{})
+	cases := make([]reflect.SelectCase, len(unique))
+	for i, ch := range unique {
+		cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)}
+	}
+	go func() {
+		reflect.Select(cases)
+		close(merged)
+	}()
+	return merged
+}
+
 // LowerBound is used to construct a ResultIterator over all the the range of
 // rows that have an index value greater than or equal to the provide args.
 // Calling this then iterating until the rows are larger than required allows
@@ -998,6 +1108,48 @@ func (r *radixReverseIterator) Next() interface{} {
 
 func (r *radixReverseIterator) WatchCh() <-chan struct{} {
 	return r.watchCh
+}
+
+// multiIterator is used to iterate over the union of several index
+// iterators, de-duplicating rows that appear in more than one of them.
+// Like radixIterator it streams results and does not materialize the
+// entire view; only the id keys of rows already returned are retained.
+type multiIterator struct {
+	iters     []*iradix.Iterator
+	idx       int
+	idIndexer SingleIndexer
+	seen      map[string]struct{}
+	watchCh   <-chan struct{}
+}
+
+func (m *multiIterator) WatchCh() <-chan struct{} {
+	return m.watchCh
+}
+
+func (m *multiIterator) Next() interface{} {
+	for m.idx < len(m.iters) {
+		_, value, ok := m.iters[m.idx].Next()
+		if !ok {
+			m.idx++
+			continue
+		}
+
+		// Compute the id key of the row to de-duplicate across queries.
+		// Every stored row has a valid id key (it is enforced on Insert),
+		// so a failure here is not expected; skip the row defensively
+		// rather than risk emitting duplicates.
+		keyOk, key, err := m.idIndexer.FromObject(value)
+		if err != nil || !keyOk {
+			continue
+		}
+		strKey := string(key)
+		if _, dup := m.seen[strKey]; dup {
+			continue
+		}
+		m.seen[strKey] = struct{}{}
+		return value
+	}
+	return nil
 }
 
 // Snapshot creates a snapshot of the current state of the transaction.

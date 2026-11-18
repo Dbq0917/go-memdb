@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testDB(t *testing.T) *MemDB {
@@ -2229,5 +2230,155 @@ func assertNilError(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatalf("expected nil error, got %v", err)
+	}
+}
+
+func TestTxn_GetMulti_UnionDedup(t *testing.T) {
+	db := testDB(t)
+	txn := db.Txn(true)
+
+	// obj2 matches both queries below, obj1 and obj3 match one each.
+	objs := []*TestObject{
+		{ID: "obj1", Foo: "abc", Qux: []string{"red"}},
+		{ID: "obj2", Foo: "abc", Qux: []string{"blue"}},
+		{ID: "obj3", Foo: "def", Qux: []string{"blue", "red"}},
+		{ID: "obj4", Foo: "zzz", Qux: []string{"green"}},
+	}
+	for _, obj := range objs {
+		assertNilError(t, txn.Insert("main", obj))
+	}
+	txn.Commit()
+
+	txn = db.Txn(false)
+	iter, err := txn.GetMulti("main",
+		IndexQuery{Index: "foo", Args: []interface{}{"abc"}},
+		IndexQuery{Index: "qux", Args: []interface{}{"blue"}},
+	)
+	assertNilError(t, err)
+
+	seen := make(map[string]int)
+	count := 0
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		obj := raw.(*TestObject)
+		seen[obj.ID]++
+		count++
+	}
+
+	// The union of the two queries is obj1, obj2, obj3. obj2 matches both
+	// queries but must be returned exactly once, so the total count must
+	// match the number of distinct rows.
+	if count != 3 {
+		t.Fatalf("bad count: %d", count)
+	}
+	expect := map[string]int{"obj1": 1, "obj2": 1, "obj3": 1}
+	if !reflect.DeepEqual(seen, expect) {
+		t.Fatalf("bad: %#v", seen)
+	}
+}
+
+func TestTxn_GetMulti_NoMatch(t *testing.T) {
+	db := testDB(t)
+	txn := db.Txn(true)
+	assertNilError(t, txn.Insert("main", &TestObject{ID: "obj1", Foo: "abc", Qux: []string{"red"}}))
+	txn.Commit()
+
+	txn = db.Txn(false)
+	iter, err := txn.GetMulti("main",
+		IndexQuery{Index: "foo", Args: []interface{}{"nope"}},
+		IndexQuery{Index: "qux", Args: []interface{}{"nope"}},
+	)
+	assertNilError(t, err)
+	if raw := iter.Next(); raw != nil {
+		t.Fatalf("bad: %#v", raw)
+	}
+}
+
+func TestTxn_GetMulti_Errors(t *testing.T) {
+	db := testDB(t)
+	txn := db.Txn(false)
+
+	// No queries.
+	if _, err := txn.GetMulti("main"); err == nil {
+		t.Fatalf("should err")
+	}
+
+	// Invalid table.
+	_, err := txn.GetMulti("nope", IndexQuery{Index: "foo", Args: []interface{}{"abc"}})
+	if err == nil {
+		t.Fatalf("should err")
+	}
+
+	// Invalid index.
+	_, err = txn.GetMulti("main", IndexQuery{Index: "nope", Args: []interface{}{"abc"}})
+	if err == nil {
+		t.Fatalf("should err")
+	}
+}
+
+func TestTxn_GetMulti_Prefix(t *testing.T) {
+	db := testDB(t)
+	txn := db.Txn(true)
+	assertNilError(t, txn.Insert("main", &TestObject{ID: "obj1", Foo: "mem", Qux: []string{"red"}}))
+	assertNilError(t, txn.Insert("main", &TestObject{ID: "obj2", Foo: "memdb", Qux: []string{"blue"}}))
+	assertNilError(t, txn.Insert("main", &TestObject{ID: "obj3", Foo: "other", Qux: []string{"green"}}))
+	txn.Commit()
+
+	txn = db.Txn(false)
+	iter, err := txn.GetMulti("main",
+		IndexQuery{Index: "foo_prefix", Args: []interface{}{"mem"}},
+		IndexQuery{Index: "id", Args: []interface{}{"obj1"}},
+	)
+	assertNilError(t, err)
+
+	seen := make(map[string]int)
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		seen[raw.(*TestObject).ID]++
+	}
+	expect := map[string]int{"obj1": 1, "obj2": 1}
+	if !reflect.DeepEqual(seen, expect) {
+		t.Fatalf("bad: %#v", seen)
+	}
+}
+
+func TestTxn_GetMulti_Watch(t *testing.T) {
+	db := testDB(t)
+	txn := db.Txn(true)
+	obj1 := &TestObject{ID: "obj1", Foo: "abc", Qux: []string{"red"}}
+	obj2 := &TestObject{ID: "obj2", Foo: "def", Qux: []string{"blue"}}
+	assertNilError(t, txn.Insert("main", obj1))
+	assertNilError(t, txn.Insert("main", obj2))
+	txn.Commit()
+
+	txn = db.Txn(false)
+	iter, err := txn.GetMulti("main",
+		IndexQuery{Index: "foo", Args: []interface{}{"abc"}},
+		IndexQuery{Index: "qux", Args: []interface{}{"blue"}},
+	)
+	assertNilError(t, err)
+	watchCh := iter.WatchCh()
+	if watchCh == nil {
+		t.Fatalf("should have a watch channel")
+	}
+
+	// A write that doesn't touch either query should not fire the watch.
+	txn2 := db.Txn(true)
+	assertNilError(t, txn2.Insert("main", &TestObject{ID: "obj3", Foo: "zzz", Qux: []string{"green"}}))
+	txn2.Commit()
+
+	select {
+	case <-watchCh:
+		t.Fatalf("should not fire")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// A write matching the second query should fire the watch.
+	txn3 := db.Txn(true)
+	assertNilError(t, txn3.Delete("main", obj2))
+	txn3.Commit()
+
+	select {
+	case <-watchCh:
+	case <-time.After(time.Second):
+		t.Fatalf("should fire")
 	}
 }

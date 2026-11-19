@@ -29,6 +29,36 @@ The database provides the following:
 
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
+Writer locking and long transactions
+====================================
+
+There is a single writer at a time, but the writer lock is acquired **lazily on
+the first mutation** of a write transaction rather than when the transaction is
+opened. A write transaction that only performs reads therefore holds no lock
+and never blocks other writers. The lock is still held for the duration of any
+actual writes and is released on `Commit` or `Abort`. This keeps write latency
+flat in read-heavy services that keep long-lived transactions (for example a
+reporting job) open for a long time.
+
+Two optional bounds are available through `NewMemDBWithOptions`:
+
+* `MaxLockWait` bounds how long a write transaction waits for the writer lock
+  during its first mutation. If the bound is reached the mutation returns
+  `ErrWriteLockTimeout` and the transaction is aborted automatically.
+* `MaxTxnAge` bounds the age of a write transaction at the moment it performs
+  its first mutation. An older transaction fails with `ErrTxnTooOld` instead of
+  taking the lock, so stale transactions can be detected and retried.
+
+`TxnCtx` binds a `context.Context` to a write transaction so canceling the
+context also abandons a blocked lock acquisition. Both bounds default to zero,
+which preserves the unbounded historical behavior.
+
+For observability, `MemDB` exposes:
+
+* `WriteTxns` / `OldestWriteTxnAge` to identify long-running write transactions.
+* `WriterLockStats` for contention counters, cumulative wait time, and the
+  current lock hold time.
+
 Documentation
 =============
 

@@ -5,9 +5,11 @@ package memdb
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	iradix "github.com/hashicorp/go-immutable-radix"
@@ -41,6 +43,92 @@ type Txn struct {
 	changes Changes
 
 	modified map[tableIndex]*iradix.Txn
+
+	// id is the registry identifier for a write transaction (zero for reads).
+	id uint64
+
+	// ctx bounds writer-lock acquisition for write transactions.
+	ctx context.Context
+
+	// started is when the transaction was created.
+	started time.Time
+
+	// mutating is set after the first mutation acquires the writer lock.
+	mutating bool
+}
+
+// beginWrite acquires the single-writer lock lazily on the first mutation of
+// a write transaction. Until this point the transaction holds no lock and
+// therefore cannot block other writers. The lock is released by Commit or
+// Abort.
+func (txn *Txn) beginWrite() error {
+	if !txn.write {
+		return fmt.Errorf("cannot mutate a read-only transaction")
+	}
+	if txn.rootTxn == nil {
+		return fmt.Errorf("transaction already committed or aborted")
+	}
+	if txn.mutating {
+		return nil
+	}
+
+	// Reject stale transactions before they can take the writer lock. This
+	// bounds the damage of a long-lived write transaction used in a
+	// read-heavy service.
+	if maxAge := txn.db.MaxTxnAge; maxAge > 0 && time.Since(txn.started) >= maxAge {
+		txn.Abort()
+		return ErrTxnTooOld
+	}
+
+	ctx := txn.ctx
+	if maxWait := txn.db.MaxLockWait; maxWait > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, maxWait)
+		defer cancel()
+	}
+
+	if err := txn.db.writer.acquire(ctx); err != nil {
+		txn.Abort()
+		return err
+	}
+
+	// Re-base onto the latest committed root before touching any index. The
+	// writer lock is held here, so we are the sole active writer: refreshing
+	// guarantees two write transactions never build mutations on the same
+	// base tree (which would double-close radix mutation channels on commit),
+	// while read-only activity before this point still holds no lock.
+	txn.rootTxn = txn.db.getRoot().Txn()
+
+	txn.mutating = true
+	now := time.Now()
+	txn.db.setHoldStart(now)
+	txn.db.registry.markLocked(txn, now)
+	return nil
+}
+
+// ID returns the registry identifier of a write transaction, or zero for a
+// read transaction. It matches WriteTxnInfo.ID.
+func (txn *Txn) ID() uint64 {
+	return txn.id
+}
+
+// Started returns the time the transaction was created.
+func (txn *Txn) Started() time.Time {
+	if txn.started.IsZero() {
+		txn.started = time.Now()
+	}
+	return txn.started
+}
+
+// Age returns how long the transaction has been open.
+func (txn *Txn) Age() time.Duration {
+	return time.Since(txn.Started())
+}
+
+// Mutating reports whether the transaction has performed its first mutation
+// and therefore currently holds the writer lock.
+func (txn *Txn) Mutating() bool {
+	return txn.mutating
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -118,13 +206,20 @@ func (txn *Txn) Abort() {
 		return
 	}
 
+	// Remove the transaction from introspection first.
+	txn.db.registry.unregister(txn)
+
+	// Only the first mutation takes the writer lock; a write transaction that
+	// only read never held it and must not release it.
+	if txn.mutating {
+		txn.db.clearHoldStart()
+		txn.db.writer.release()
+	}
+
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
 	txn.changes = nil
-
-	// Release the writer lock since this is invalid
-	txn.db.writer.Unlock()
 }
 
 // Commit is used to finalize this transaction.
@@ -138,6 +233,17 @@ func (txn *Txn) Commit() {
 
 	// Check if already aborted or committed
 	if txn.rootTxn == nil {
+		return
+	}
+
+	// A write transaction that never mutated holds no writer lock and has no
+	// changes to publish. It simply goes away so it never blocks other
+	// writers, while still running its deferred functions.
+	if !txn.mutating {
+		txn.db.registry.unregister(txn)
+		txn.rootTxn = nil
+		txn.modified = nil
+		txn.runAfter()
 		return
 	}
 
@@ -161,14 +267,22 @@ func (txn *Txn) Commit() {
 	}
 	txn.rootTxn.Notify()
 
+	txn.db.registry.unregister(txn)
+	txn.db.clearHoldStart()
+
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
 
-	// Release the writer lock since this is invalid
-	txn.db.writer.Unlock()
+	// Release the writer lock only after the new root is published.
+	txn.db.writer.release()
 
 	// Run the deferred functions, if any
+	txn.runAfter()
+}
+
+// runAfter invokes deferred functions in LIFO order.
+func (txn *Txn) runAfter() {
 	for i := len(txn.after); i > 0; i-- {
 		fn := txn.after[i-1]
 		fn()
@@ -181,8 +295,8 @@ func (txn *Txn) Commit() {
 // than a value updated in-place. Modifying values in-place that are already
 // inserted into MemDB is not supported behavior.
 func (txn *Txn) Insert(table string, obj interface{}) error {
-	if !txn.write {
-		return fmt.Errorf("cannot insert in read-only transaction")
+	if err := txn.beginWrite(); err != nil {
+		return err
 	}
 
 	// Get the table schema
@@ -305,8 +419,8 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 // Delete is used to delete a single object from the given table.
 // This object must already exist in the table.
 func (txn *Txn) Delete(table string, obj interface{}) error {
-	if !txn.write {
-		return fmt.Errorf("cannot delete in read-only transaction")
+	if err := txn.beginWrite(); err != nil {
+		return err
 	}
 
 	// Get the table schema
@@ -382,8 +496,8 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 // These will be removed from all other indexes, and then a special prefix operation will delete the objects from the given index in an efficient subtree delete operation.
 // This is useful when you have a very large number of objects indexed by the given index, along with a much smaller number of entries in the other indexes for those objects.
 func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (bool, error) {
-	if !txn.write {
-		return false, fmt.Errorf("cannot delete in read-only transaction")
+	if err := txn.beginWrite(); err != nil {
+		return false, err
 	}
 
 	if !strings.HasSuffix(prefix_index, "_prefix") {
@@ -484,8 +598,8 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 // DeleteAll is used to delete all the objects in a given table
 // matching the constraints on the index
 func (txn *Txn) DeleteAll(table, index string, args ...interface{}) (int, error) {
-	if !txn.write {
-		return 0, fmt.Errorf("cannot delete in read-only transaction")
+	if err := txn.beginWrite(); err != nil {
+		return 0, err
 	}
 
 	// Get all the objects

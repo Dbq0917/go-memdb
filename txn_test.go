@@ -2231,3 +2231,151 @@ func assertNilError(t *testing.T, err error) {
 		t.Fatalf("expected nil error, got %v", err)
 	}
 }
+
+// checkObjAbsentFromSecondaryIndexes asserts that the given object is not
+// reachable through any of the secondary indexes of the "main" table. It is
+// used to verify that once a record is deleted, it is immediately invisible
+// to secondary index lookups.
+func checkObjAbsentFromSecondaryIndexes(t *testing.T, txn *Txn, obj *TestObject) {
+	t.Helper()
+
+	// Exact lookup on the non-unique secondary index.
+	raw, err := txn.First("main", "foo", obj.Foo)
+	assertNilError(t, err)
+	if raw != nil {
+		t.Fatalf("deleted object visible via index 'foo': %#v", raw)
+	}
+
+	// Exact lookup on the multi-value secondary index.
+	for _, qux := range obj.Qux {
+		raw, err = txn.First("main", "qux", qux)
+		assertNilError(t, err)
+		if raw != nil {
+			t.Fatalf("deleted object visible via index 'qux': %#v", raw)
+		}
+	}
+
+	// Full scans of every index must not surface the deleted object.
+	for _, index := range []string{"id", "foo", "qux"} {
+		it, err := txn.Get("main", index)
+		assertNilError(t, err)
+		for got := it.Next(); got != nil; got = it.Next() {
+			if got.(*TestObject).ID == obj.ID {
+				t.Fatalf("deleted object found by full scan of index '%s': %#v", index, got)
+			}
+		}
+	}
+}
+
+func TestTxn_Delete_SecondaryIndexVisibility(t *testing.T) {
+	db := testDB(t)
+
+	obj := &TestObject{
+		ID:  "doomed-obj",
+		Foo: "doomed-foo",
+		Qux: []string{"doomed-qux"},
+	}
+	other := &TestObject{
+		ID:  "surviving-obj",
+		Foo: "surviving-foo",
+		Qux: []string{"surviving-qux"},
+	}
+
+	txn := db.Txn(true)
+	assertNilError(t, txn.Insert("main", obj))
+	assertNilError(t, txn.Insert("main", other))
+	txn.Commit()
+
+	// Delete the record in its own transaction.
+	txn = db.Txn(true)
+	assertNilError(t, txn.Delete("main", obj))
+	txn.Commit()
+
+	// Immediately after the delete commits, the record must not be
+	// reachable through any secondary index.
+	txn = db.Txn(false)
+	checkObjAbsentFromSecondaryIndexes(t, txn, obj)
+	txn.Abort()
+
+	// The result of querying again later (after unrelated writes) must be
+	// identical to querying immediately after the delete.
+	txn = db.Txn(true)
+	assertNilError(t, txn.Insert("main", &TestObject{ID: "unrelated", Foo: "unrelated", Qux: []string{"unrelated"}}))
+	txn.Commit()
+
+	txn = db.Txn(false)
+	checkObjAbsentFromSecondaryIndexes(t, txn, obj)
+
+	// The surviving records must still be visible through the indexes.
+	raw, err := txn.First("main", "foo", other.Foo)
+	assertNilError(t, err)
+	if raw != other {
+		t.Fatalf("bad: %#v %#v", raw, other)
+	}
+	txn.Abort()
+}
+
+func TestTxn_Delete_SecondaryIndexVisibility_SameTxn(t *testing.T) {
+	db := testDB(t)
+
+	obj := &TestObject{
+		ID:  "doomed-obj",
+		Foo: "doomed-foo",
+		Qux: []string{"doomed-qux"},
+	}
+
+	txn := db.Txn(true)
+	assertNilError(t, txn.Insert("main", obj))
+	txn.Commit()
+
+	// Delete the record and query by secondary index within the same
+	// transaction. The delete must be visible to the transaction itself.
+	txn = db.Txn(true)
+	assertNilError(t, txn.Delete("main", obj))
+	checkObjAbsentFromSecondaryIndexes(t, txn, obj)
+	txn.Commit()
+
+	// Deleting with a stub object that only carries the primary key must
+	// also remove the record from every secondary index.
+	txn = db.Txn(true)
+	assertNilError(t, txn.Insert("main", obj))
+	txn.Commit()
+
+	txn = db.Txn(true)
+	assertNilError(t, txn.Delete("main", &TestObject{ID: obj.ID}))
+	txn.Commit()
+
+	txn = db.Txn(false)
+	checkObjAbsentFromSecondaryIndexes(t, txn, obj)
+	txn.Abort()
+}
+
+func BenchmarkTxn_Delete(b *testing.B) {
+	db, err := NewMemDB(testValidSchema())
+	if err != nil {
+		b.Fatalf("err: %v", err)
+	}
+
+	// Pre-populate the objects to delete so setup is not measured.
+	txn := db.Txn(true)
+	for i := 0; i < b.N; i++ {
+		obj := &TestObject{
+			ID:  fmt.Sprintf("obj-%d", i),
+			Foo: "foo",
+			Qux: []string{"qux"},
+		}
+		if err := txn.Insert("main", obj); err != nil {
+			b.Fatalf("err: %v", err)
+		}
+	}
+	txn.Commit()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		txn := db.Txn(true)
+		if err := txn.Delete("main", &TestObject{ID: fmt.Sprintf("obj-%d", i)}); err != nil {
+			b.Fatalf("err: %v", err)
+		}
+		txn.Commit()
+	}
+}

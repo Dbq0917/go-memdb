@@ -202,16 +202,24 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 		return fmt.Errorf("object missing primary index")
 	}
 
-	// Lookup the object by ID first, to see if this is an update
-	idTxn := txn.writableIndex(table, id)
+	// Lookup the object by ID first, to see if this is an update. Use a
+	// read-only view so a failed insert does not mark the primary index as
+	// modified before validation has completed.
+	idTxn := txn.readableIndex(table, id)
 	existing, update := idTxn.Get(idVal)
 
 	// On an update, there is an existing object with the given
 	// primary ID. We do the update by deleting the current object
-	// and inserting the new object.
+	// and inserting the new object. Compute all index mutations before
+	// applying any of them so an indexer error or a missing required value
+	// leaves every index unchanged.
+	type indexMutation struct {
+		index   string
+		deletes [][]byte
+		inserts [][]byte
+	}
+	mutations := make([]indexMutation, 0, len(tableSchema.Indexes))
 	for name, indexSchema := range tableSchema.Indexes {
-		indexTxn := txn.writableIndex(table, name)
-
 		// Determine the new index value
 		var (
 			ok   bool
@@ -238,6 +246,8 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 				vals[i] = append(vals[i], idVal...)
 			}
 		}
+
+		var deletes [][]byte
 
 		// Handle the update by deleting from the index first
 		if update {
@@ -270,7 +280,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 					// we can avoid the delete as the insert will overwrite the
 					// value anyways.
 					if i >= len(vals) || !bytes.Equal(valExist, vals[i]) {
-						indexTxn.Delete(valExist)
+						deletes = append(deletes, valExist)
 					}
 				}
 			}
@@ -279,15 +289,30 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 		// If there is no index value, either this is an error or an expected
 		// case and we can skip updating
 		if !ok {
-			if indexSchema.AllowMissing {
-				continue
-			} else {
+			if !indexSchema.AllowMissing {
 				return fmt.Errorf("missing value for index '%s'", name)
 			}
+			if len(deletes) == 0 {
+				continue
+			}
+			vals = nil
 		}
 
-		// Update the value of the index
-		for _, val := range vals {
+		mutations = append(mutations, indexMutation{
+			index:   name,
+			deletes: deletes,
+			inserts: vals,
+		})
+	}
+
+	// Apply the validated mutations. Each index is written at most once, so
+	// a successful insert still costs one pass over the table's indexes.
+	for _, mutation := range mutations {
+		indexTxn := txn.writableIndex(table, mutation.index)
+		for _, val := range mutation.deletes {
+			indexTxn.Delete(val)
+		}
+		for _, val := range mutation.inserts {
 			indexTxn.Insert(val, obj)
 		}
 	}

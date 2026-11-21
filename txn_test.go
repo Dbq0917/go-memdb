@@ -65,6 +65,101 @@ func TestTxn_Insert_First(t *testing.T) {
 	}
 }
 
+func TestTxn_InsertErrorIsAtomicAcrossIndexes(t *testing.T) {
+	schema := &DBSchema{
+		Tables: map[string]*TableSchema{
+			"main": &TableSchema{
+				Name: "main",
+				Indexes: map[string]*IndexSchema{
+					"id": &IndexSchema{
+						Name:    "id",
+						Unique:  true,
+						Indexer: &StringFieldIndex{Field: "ID"},
+					},
+					"foo": &IndexSchema{
+						Name:    "foo",
+						Unique:  true,
+						Indexer: &StringFieldIndex{Field: "Foo"},
+					},
+					"foo_copy": &IndexSchema{
+						Name:    "foo_copy",
+						Indexer: &StringFieldIndex{Field: "Foo"},
+					},
+				},
+			},
+		},
+	}
+	db, err := NewMemDB(schema)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	original := &TestObject{ID: "obj-1", Foo: "alpha"}
+	txn := db.Txn(true)
+	if err := txn.Insert("main", original); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	txn.Commit()
+
+	txn = db.Txn(true)
+	err = txn.Insert("main", &TestObject{ID: "obj-1"})
+	if err == nil || !strings.Contains(err.Error(), "missing value for index") {
+		t.Fatalf("err: %v", err)
+	}
+
+	for _, tc := range []struct {
+		index string
+		arg   string
+	}{
+		{"id", original.ID},
+		{"foo", original.Foo},
+		{"foo_copy", original.Foo},
+	} {
+		raw, err := txn.First("main", tc.index, tc.arg)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.index, err)
+		}
+		if raw != original {
+			t.Fatalf("%s: bad: %#v", tc.index, raw)
+		}
+	}
+
+	err = txn.Insert("main", &TestObject{ID: "obj-2"})
+	if err == nil || !strings.Contains(err.Error(), "missing value for index") {
+		t.Fatalf("err: %v", err)
+	}
+	raw, err := txn.First("main", "id", "obj-2")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if raw != nil {
+		t.Fatalf("bad: %#v", raw)
+	}
+
+	updated := &TestObject{ID: "obj-1", Foo: "beta"}
+	if err := txn.Insert("main", updated); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	for _, index := range []string{"foo", "foo_copy"} {
+		raw, err := txn.First("main", index, updated.Foo)
+		if err != nil {
+			t.Fatalf("%s: %v", index, err)
+		}
+		if raw != updated {
+			t.Fatalf("%s: bad: %#v", index, raw)
+		}
+
+		raw, err = txn.First("main", index, original.Foo)
+		if err != nil {
+			t.Fatalf("%s: %v", index, err)
+		}
+		if raw != nil {
+			t.Fatalf("%s: old value still present: %#v", index, raw)
+		}
+	}
+	txn.Commit()
+}
+
 func TestTxn_InsertUpdate_First(t *testing.T) {
 	db := testDB(t)
 	txn := db.Txn(true)

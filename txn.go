@@ -20,6 +20,10 @@ const (
 var (
 	// ErrNotFound is returned when the requested item is not found
 	ErrNotFound = fmt.Errorf("not found")
+
+	// ErrUniqueConstraint is returned when committing a transaction would
+	// leave two rows with the same value for a unique index.
+	ErrUniqueConstraint = fmt.Errorf("unique constraint violation")
 )
 
 // tableIndex is a tuple of (Table, Index) used for lookups
@@ -41,6 +45,10 @@ type Txn struct {
 	changes Changes
 
 	modified map[tableIndex]*iradix.Txn
+
+	// uniqueKeys tracks the unique index values touched by this transaction.
+	// The commit-time uniqueness check only needs to inspect these keys.
+	uniqueKeys map[tableIndex]map[string]struct{}
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -121,24 +129,46 @@ func (txn *Txn) Abort() {
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+	txn.uniqueKeys = nil
 	txn.changes = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
 }
 
-// Commit is used to finalize this transaction.
+// Commit is used to finalize this transaction. It returns an error and
+// aborts the transaction if committing would violate a unique index.
+//
 // This is a noop for read transactions,
 // already aborted or committed transactions.
-func (txn *Txn) Commit() {
+func (txn *Txn) Commit() error {
+	return txn.commit()
+}
+
+// CommitWithError is equivalent to Commit. It is provided for callers that
+// prefer an explicit name for the error-returning commit operation.
+func (txn *Txn) CommitWithError() error {
+	return txn.commit()
+}
+
+func (txn *Txn) commit() error {
 	// Noop for a read transaction
 	if !txn.write {
-		return
+		return nil
 	}
 
 	// Check if already aborted or committed
 	if txn.rootTxn == nil {
-		return
+		return nil
+	}
+
+	// Re-check uniqueness against the latest committed state before
+	// publishing any index changes. If a conflict was introduced after the
+	// transaction performed its own reads, abort without making any of its
+	// changes visible.
+	if err := txn.checkUniqueConstraints(); err != nil {
+		txn.Abort()
+		return err
 	}
 
 	// Commit each sub-transaction scoped to (table, index)
@@ -164,6 +194,7 @@ func (txn *Txn) Commit() {
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+	txn.uniqueKeys = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -173,6 +204,7 @@ func (txn *Txn) Commit() {
 		fn := txn.after[i-1]
 		fn()
 	}
+	return nil
 }
 
 // Insert is used to add or update an object into the given table.
@@ -289,8 +321,12 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 		// Update the value of the index
 		for _, val := range vals {
 			indexTxn.Insert(val, obj)
+			if indexSchema.Unique {
+				txn.trackUniqueKey(table, name, val)
+			}
 		}
 	}
+
 	if txn.changes != nil {
 		txn.changes = append(txn.changes, Change{
 			Table:      table,
@@ -300,6 +336,155 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 		})
 	}
 	return nil
+}
+
+// checkUniqueConstraints verifies that the unique index values touched by this
+// transaction did not overwrite a row that remains visible after the commit.
+// Only the touched keys and their staged views are inspected, so the check is
+// proportional to the transaction's writes rather than the table size.
+func (txn *Txn) checkUniqueConstraints() error {
+	for indexKey, keys := range txn.uniqueKeys {
+		table := indexKey.Table
+		name := indexKey.Index
+		tableSchema := txn.db.schema.Tables[table]
+		indexSchema := tableSchema.Indexes[name]
+		primaryTxn := txn.finalIndex(table, id)
+		committedIndex := txn.originalIndex(table, name)
+		stagedIndex := txn.finalIndex(table, name)
+
+		for key := range keys {
+			val := []byte(key)
+			committedObj, hasCommitted := committedIndex.Get(val)
+			stagedObj, hasStaged := stagedIndex.Get(val)
+
+			var stagedID []byte
+			if hasStaged {
+				var err error
+				stagedID, err = txn.primaryKey(table, stagedObj)
+				if err != nil {
+					return err
+				}
+
+				finalObj, ok := primaryTxn.Get(stagedID)
+				if !ok {
+					return fmt.Errorf("%w: index '%s' on table '%s' references missing object %q",
+						ErrUniqueConstraint, name, table, stagedID)
+				}
+				ownsValue, err := txn.indexHasValue(indexSchema, finalObj, val)
+				if err != nil {
+					return fmt.Errorf("failed to build index '%s': %v", name, err)
+				}
+				if !ownsValue {
+					return fmt.Errorf("%w: index '%s' on table '%s' has a stale value for object %q",
+						ErrUniqueConstraint, name, table, stagedID)
+				}
+			}
+
+			if !hasCommitted {
+				continue
+			}
+			committedID, err := txn.primaryKey(table, committedObj)
+			if err != nil {
+				return err
+			}
+
+			finalOwner, ok := primaryTxn.Get(committedID)
+			if !ok {
+				continue
+			}
+			ownsValue, err := txn.indexHasValue(indexSchema, finalOwner, val)
+			if err != nil {
+				return fmt.Errorf("failed to build index '%s': %v", name, err)
+			}
+			if !ownsValue {
+				continue
+			}
+
+			if !hasStaged {
+				return fmt.Errorf("%w: index '%s' on table '%s' dropped committed value for object %q",
+					ErrUniqueConstraint, name, table, committedID)
+			}
+			if !bytes.Equal(stagedID, committedID) {
+				return fmt.Errorf("%w: duplicate value for index '%s' on table '%s'",
+					ErrUniqueConstraint, name, table)
+			}
+		}
+	}
+	return nil
+}
+
+// trackUniqueKey records a unique index value mutated by the transaction.
+func (txn *Txn) trackUniqueKey(table, index string, val []byte) {
+	if txn.uniqueKeys == nil {
+		txn.uniqueKeys = make(map[tableIndex]map[string]struct{})
+	}
+	key := tableIndex{table, index}
+	keys := txn.uniqueKeys[key]
+	if keys == nil {
+		keys = make(map[string]struct{})
+		txn.uniqueKeys[key] = keys
+	}
+	keys[string(val)] = struct{}{}
+}
+
+// finalIndex returns the staged view of an index, or the committed view when
+// this transaction did not modify it.
+func (txn *Txn) finalIndex(table, index string) *iradix.Txn {
+	if subTxn, ok := txn.modified[tableIndex{table, index}]; ok {
+		return subTxn
+	}
+	return txn.readableIndex(table, index)
+}
+
+// originalIndex returns the committed view of an index from before this
+// transaction.
+func (txn *Txn) originalIndex(table, index string) *iradix.Txn {
+	raw, _ := txn.rootTxn.Get(indexPath(table, index))
+	return raw.(*iradix.Tree).Txn()
+}
+
+// primaryKey extracts the encoded primary key from an object.
+func (txn *Txn) primaryKey(table string, obj interface{}) ([]byte, error) {
+	tableSchema, ok := txn.db.schema.Tables[table]
+	if !ok {
+		return nil, fmt.Errorf("invalid table '%s'", table)
+	}
+	indexer := tableSchema.Indexes[id].Indexer.(SingleIndexer)
+	ok, val, err := indexer.FromObject(obj)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build primary index: %v", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("object missing primary index")
+	}
+	return val, nil
+}
+
+// indexValues extracts all values an object contributes to an index.
+func (txn *Txn) indexValues(indexSchema *IndexSchema, obj interface{}) (bool, [][]byte, error) {
+	switch indexer := indexSchema.Indexer.(type) {
+	case SingleIndexer:
+		ok, val, err := indexer.FromObject(obj)
+		return ok, [][]byte{val}, err
+	case MultiIndexer:
+		return indexer.FromObject(obj)
+	default:
+		return false, nil, fmt.Errorf("index '%s' has an invalid indexer", indexSchema.Name)
+	}
+}
+
+// indexHasValue reports whether obj still contributes val to the index.
+func (txn *Txn) indexHasValue(indexSchema *IndexSchema, obj interface{}, val []byte) (bool, error) {
+	ok, vals, err := txn.indexValues(indexSchema, obj)
+	if err != nil || !ok {
+		return false, err
+	}
+	for _, candidate := range vals {
+		if bytes.Equal(candidate, val) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Delete is used to delete a single object from the given table.
@@ -363,6 +548,9 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 					val = append(val, idVal...)
 				}
 				indexTxn.Delete(val)
+				if indexSchema.Unique {
+					txn.trackUniqueKey(table, name, val)
+				}
 			}
 		}
 	}
@@ -465,6 +653,9 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 						val = append(val, idVal...)
 					}
 					indexTxn.Delete(val)
+					if indexSchema.Unique {
+						txn.trackUniqueKey(table, name, val)
+					}
 				}
 			}
 		}

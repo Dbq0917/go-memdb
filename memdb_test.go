@@ -4,6 +4,9 @@
 package memdb
 
 import (
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -40,6 +43,88 @@ func TestMemDB_SingleWriter_MultiReader(t *testing.T) {
 	case <-doneCh:
 	case <-time.After(10 * time.Millisecond):
 		t.Fatalf("should allow another writer")
+	}
+}
+
+func TestMemDB_ConcurrentInsert_UniqueConstraint(t *testing.T) {
+	schema := &DBSchema{
+		Tables: map[string]*TableSchema{
+			"main": {
+				Name: "main",
+				Indexes: map[string]*IndexSchema{
+					"id": {
+						Name:    "id",
+						Unique:  true,
+						Indexer: &StringFieldIndex{Field: "ID"},
+					},
+					"foo": {
+						Name:    "foo",
+						Unique:  true,
+						Indexer: &StringFieldIndex{Field: "Foo"},
+					},
+				},
+			},
+		},
+	}
+	db, err := NewMemDB(schema)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	const workers = 2
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+
+			txn := db.Txn(true)
+			obj := &TestObject{
+				ID:  fmt.Sprintf("object-%d", i),
+				Foo: "shared",
+			}
+			if err := txn.Insert("main", obj); err != nil {
+				errs <- err
+				txn.Abort()
+				return
+			}
+			errs <- txn.Commit()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	var committed, rejected int
+	for err := range errs {
+		if err == nil {
+			committed++
+			continue
+		}
+		if !errors.Is(err, ErrUniqueConstraint) {
+			t.Fatalf("unexpected commit error: %v", err)
+		}
+		rejected++
+	}
+	if committed != 1 || rejected != 1 {
+		t.Fatalf("expected one commit and one rejection, got %d and %d", committed, rejected)
+	}
+
+	txn := db.Txn(false)
+	defer txn.Abort()
+	iter, err := txn.Get("main", "id")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	var rows int
+	for iter.Next() != nil {
+		rows++
+	}
+	if rows != 1 {
+		t.Fatalf("expected one row after concurrent insert, got %d", rows)
 	}
 }
 

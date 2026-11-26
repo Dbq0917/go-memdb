@@ -304,6 +304,19 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 
 // Delete is used to delete a single object from the given table.
 // This object must already exist in the table.
+//
+// When the table schema declares Relations they are enforced as part of the
+// same transaction. A Restrict relation with at least one referencing object
+// fails with an error wrapping ErrReferenceExists before the object is
+// removed; a Cascade relation removes every referencing object, recursively
+// applying any relations declared on the referencing tables. Tables without
+// declared relations keep their historical behavior and leave referencing
+// objects untouched.
+//
+// Cascade deletions stream over the referenced objects rather than loading
+// them all into memory at once, so a relation may span a very large number of
+// objects. As with any transaction, either all of the deletes commit together
+// or Abort discards the entire batch.
 func (txn *Txn) Delete(table string, obj interface{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot delete in read-only transaction")
@@ -333,11 +346,104 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 		return ErrNotFound
 	}
 
-	// Remove the object from all the indexes
+	// visited guarantees termination if relations ever form a cycle and also
+	// avoids deleting the same object twice within one cascade. It only holds
+	// compact (table, id) keys, never the objects themselves, so a large
+	// cascade does not materialize every row in memory.
+	visited := make(map[objectID]struct{})
+	return txn.deleteObject(table, existing, visited)
+}
+
+// deleteObject streams the cascade for a single object. Every relation is
+// enforced before the object is removed: a Restrict relation with any
+// referencing object returns an error wrapping ErrReferenceExists before any
+// deletion reaches that subtree, while Cascade iterates referencing objects one
+// at a time and recurses. The result is depth-first deletes whose peak memory
+// is bounded by the relation depth plus the visited set, rather than the total
+// number of rows.
+//
+// As with any write transaction, an error means the caller must Abort, which
+// discards every deletion already performed so the batch stays atomic.
+func (txn *Txn) deleteObject(table string, existing interface{}, visited map[objectID]struct{}) error {
+	tableSchema := txn.db.schema.Tables[table]
+	idIndexer := tableSchema.Indexes[id].Indexer.(SingleIndexer)
+	ok, idVal, err := idIndexer.FromObject(existing)
+	if err != nil {
+		return fmt.Errorf("failed to build primary index: %v", err)
+	}
+	if !ok {
+		return fmt.Errorf("object missing primary index")
+	}
+
+	oid := objectID{Table: table, IndexVal: string(idVal)}
+	if _, seen := visited[oid]; seen {
+		return nil
+	}
+	visited[oid] = struct{}{}
+
+	for _, relation := range tableSchema.Relations {
+		iter, err := txn.referencingObjects(relation, idVal)
+		if err != nil {
+			return err
+		}
+
+		switch relation.OnDelete {
+		case Restrict:
+			if child := iter.Next(); child != nil {
+				return fmt.Errorf(
+					"%w: %q still references %q",
+					ErrReferenceExists, relation.Table, table,
+				)
+			}
+		case Cascade:
+			for child := iter.Next(); child != nil; child = iter.Next() {
+				if err := txn.deleteObject(relation.Table, child, visited); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if err := txn.removeFromIndexes(table, tableSchema, existing, idVal); err != nil {
+		return err
+	}
+
+	if txn.changes != nil {
+		txn.changes = append(txn.changes, Change{
+			Table:      table,
+			Before:     existing,
+			After:      nil, // Now nil indicates deletion
+			primaryKey: idVal,
+		})
+	}
+	return nil
+}
+
+// referencingObjects returns an iterator over the objects in the relation's
+// table whose relation index matches the given parent primary id. The iterator
+// is taken over a snapshot, so it stays valid even as the cascade deletes.
+func (txn *Txn) referencingObjects(relation *RelationSchema, parentID []byte) (ResultIterator, error) {
+	childSchema, ok := txn.db.schema.Tables[relation.Table]
+	if !ok {
+		return nil, fmt.Errorf("invalid table '%s'", relation.Table)
+	}
+
+	indexSchema, ok := childSchema.Indexes[relation.Index]
+	if !ok {
+		return nil, fmt.Errorf("invalid index '%s' on table '%s'", relation.Index, relation.Table)
+	}
+
+	indexTxn := txn.readableIndex(relation.Table, indexSchema.Name)
+	indexIter := indexTxn.Root().Iterator()
+	watchCh := indexIter.SeekPrefixWatch(parentID)
+	return &radixIterator{iter: indexIter, watchCh: watchCh}, nil
+}
+
+// removeFromIndexes deletes an existing object from every index of its table.
+func (txn *Txn) removeFromIndexes(table string, tableSchema *TableSchema, existing interface{}, idVal []byte) error {
 	for name, indexSchema := range tableSchema.Indexes {
 		indexTxn := txn.writableIndex(table, name)
 
-		// Handle the update by deleting from the index first
 		var (
 			ok   bool
 			vals [][]byte
@@ -365,14 +471,6 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 				indexTxn.Delete(val)
 			}
 		}
-	}
-	if txn.changes != nil {
-		txn.changes = append(txn.changes, Change{
-			Table:      table,
-			Before:     existing,
-			After:      nil, // Now nil indicates deletion
-			primaryKey: idVal,
-		})
 	}
 	return nil
 }

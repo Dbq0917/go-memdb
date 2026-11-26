@@ -27,6 +27,67 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
+* Optional Table Relations - A table may declare how objects in other tables reference
+  its objects. On delete, a relation either cascades the deletion to every referencing
+  object (recursively) or blocks the delete with `ErrReferenceExists` while references
+  remain. Cascade deletes stream through an iterator rather than buffering every row,
+  and the whole operation stays inside one transaction so it either commits entirely or
+  is rolled back on `Abort`. Tables that declare no relations keep their original
+  behavior, leaving any referencing objects untouched.
+
+Table Relations
+===============
+
+Relations are declared on the table that is referenced (the "parent"). Each entry in
+`TableSchema.Relations` names the referencing table, the index on that table whose
+values match the parent's primary id, and the action to take on delete.
+
+```go
+schema := &memdb.DBSchema{
+	Tables: map[string]*memdb.TableSchema{
+		"parent": &memdb.TableSchema{
+			Name: "parent",
+			Indexes: map[string]*memdb.IndexSchema{
+				"id": &memdb.IndexSchema{
+					Name:    "id",
+					Unique:  true,
+					Indexer: &memdb.StringFieldIndex{Field: "ID"},
+				},
+			},
+			// Deleting a parent removes (cascade) all children that point to it.
+			Relations: []*memdb.RelationSchema{
+				&memdb.RelationSchema{
+					Table:    "child",
+					Index:    "parent",
+					OnDelete: memdb.Cascade, // or memdb.Restrict
+				},
+			},
+		},
+		"child": &memdb.TableSchema{
+			Name: "child",
+			Indexes: map[string]*memdb.IndexSchema{
+				"id": &memdb.IndexSchema{
+					Name:    "id",
+					Unique:  true,
+					Indexer: &memdb.StringFieldIndex{Field: "ID"},
+				},
+				// The relation resolves children through this index.
+				"parent": &memdb.IndexSchema{
+					Name:    "parent",
+					Indexer: &memdb.StringFieldIndex{Field: "Parent"},
+				},
+			},
+		},
+	},
+}
+```
+
+With `Cascade`, `txn.Delete("parent", parent)` also deletes every matching child
+(and anything referencing those children). With `Restrict`, the same call returns an
+error wrapping `memdb.ErrReferenceExists` while any child still exists; the transaction
+must then be aborted. `DeleteAll` inherits the same behavior because it deletes through
+`Delete`. Deleting on a table without relations is unchanged.
+
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
 Documentation

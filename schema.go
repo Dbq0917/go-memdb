@@ -35,6 +35,10 @@ func (s *DBSchema) Validate() error {
 		}
 	}
 
+	if err := validateRelations(s); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -47,6 +51,12 @@ type TableSchema struct {
 	// is a unique name for the index and must match the Name in the
 	// IndexSchema.
 	Indexes map[string]*IndexSchema
+
+	// Relations optionally declares how objects in other tables reference
+	// the objects stored in this table, and how those referencing objects are
+	// handled when a referenced object is deleted. When no relations are
+	// declared, deletion behaves exactly as it did historically.
+	Relations []*RelationSchema
 }
 
 // Validate is used to validate the table schema

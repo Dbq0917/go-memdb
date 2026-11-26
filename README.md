@@ -27,6 +27,14 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
+* Read Transaction Observability - Open readers can be inspected with
+  `OldestReader`, `OldestReaderAge`, and `ActiveReaders`. Long-lived readers
+  retain old MVCC roots, so identifying the oldest one helps diagnose memory
+  growth. Reader registration is sharded to avoid serializing concurrent reads,
+  and closing a reader releases its snapshot immediately without terminating
+  any live transaction. Dropped readers are retired without retaining their
+  snapshots, while live readers are never reaped.
+
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
 Documentation

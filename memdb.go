@@ -8,6 +8,7 @@ package memdb
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/hashicorp/go-immutable-radix"
@@ -30,6 +31,10 @@ type MemDB struct {
 	schema  *DBSchema
 	root    unsafe.Pointer // *iradix.Tree underneath
 	primary bool
+
+	// readers tracks open read transactions for observability and timely
+	// snapshot release. It never retains a Txn or a database root.
+	readers readerRegistry
 
 	// There can only be a single writer at once
 	writer sync.Mutex
@@ -80,7 +85,42 @@ func (db *MemDB) Txn(write bool) *Txn {
 		write:   write,
 		rootTxn: db.getRoot().Txn(),
 	}
+	if !write {
+		txn.startReader()
+	}
 	return txn
+}
+
+// OldestReader returns information about the oldest currently open read
+// transaction. The boolean is false when the database has no open readers.
+//
+// A read transaction holds its snapshot root open until it is closed. This
+// method makes that lifetime observable so callers can identify a reader
+// that is retaining old versions for an unexpectedly long time. It does not
+// stop or otherwise interfere with the reader.
+func (db *MemDB) OldestReader() (ReaderInfo, bool) {
+	return db.readers.oldest(time.Now())
+}
+
+// OldestReaderAge returns the age of the oldest open read transaction, or
+// zero if there are no open readers.
+func (db *MemDB) OldestReaderAge() time.Duration {
+	info, ok := db.OldestReader()
+	if !ok {
+		return 0
+	}
+	return info.Age
+}
+
+// ActiveReaders returns information about all open read transactions,
+// ordered oldest first.
+func (db *MemDB) ActiveReaders() []ReaderInfo {
+	return db.readers.snapshot(time.Now())
+}
+
+// ReaderCount returns the number of read transactions currently open.
+func (db *MemDB) ReaderCount() int {
+	return db.readers.count()
 }
 
 // Snapshot is used to capture a point-in-time snapshot  of the database that

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	iradix "github.com/hashicorp/go-immutable-radix"
@@ -41,6 +42,33 @@ type Txn struct {
 	changes Changes
 
 	modified map[tableIndex]*iradix.Txn
+
+	// id and started identify a read transaction in the reader registry.
+	id         uint64
+	started    time.Time
+	readerOpen bool
+}
+
+// ID returns the identifier assigned to this read transaction, or zero for a
+// write transaction. The ID matches ReaderInfo.ID and remains stable after
+// the transaction is closed.
+func (txn *Txn) ID() uint64 {
+	return txn.id
+}
+
+// Started returns the time a read transaction was created. It returns the
+// zero time for a write transaction.
+func (txn *Txn) Started() time.Time {
+	return txn.started
+}
+
+// Age returns how long a read transaction has been open. It returns zero for
+// a write transaction.
+func (txn *Txn) Age() time.Duration {
+	if txn.started.IsZero() {
+		return 0
+	}
+	return nonNegativeDuration(time.Since(txn.started))
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -105,11 +133,14 @@ func (txn *Txn) writableIndex(table, index string) *iradix.Txn {
 }
 
 // Abort is used to cancel this transaction.
-// This is a noop for read transactions,
-// already aborted or commited transactions.
+//
+// For a read transaction, Abort releases its snapshot immediately so old
+// versions that are no longer needed can be reclaimed. Once a read
+// transaction has been aborted it must not be used for further reads.
+// Abort is a noop for already aborted or committed transactions.
 func (txn *Txn) Abort() {
-	// Noop for a read transaction
 	if !txn.write {
+		txn.closeReader()
 		return
 	}
 
@@ -128,11 +159,13 @@ func (txn *Txn) Abort() {
 }
 
 // Commit is used to finalize this transaction.
-// This is a noop for read transactions,
-// already aborted or committed transactions.
+//
+// For a read transaction, Commit releases its snapshot immediately. Once a
+// read transaction has been committed it must not be used for further reads.
+// Commit is a noop for already aborted or committed transactions.
 func (txn *Txn) Commit() {
-	// Noop for a read transaction
 	if !txn.write {
+		txn.closeReader()
 		return
 	}
 
@@ -1012,6 +1045,7 @@ func (txn *Txn) Snapshot() *Txn {
 		db:      txn.db,
 		rootTxn: txn.rootTxn.Clone(),
 	}
+	snapshot.startReader()
 
 	// Commit sub-transactions into the snapshot
 	for key, subTxn := range txn.modified {

@@ -244,6 +244,105 @@ func TestTxn_InsertUpdate_First_MultiIndex(t *testing.T) {
 	}
 }
 
+func TestTxn_Insert_FailedUpdateNotApplied(t *testing.T) {
+	db := testDB(t)
+	txn := db.Txn(true)
+
+	obj := &TestObject{
+		ID:  "my-object",
+		Foo: "abc",
+		Qux: []string{"abc1", "abc2"},
+	}
+	err := txn.Insert("main", obj)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	txn.Commit()
+
+	// Update the object with a value the "foo" index rejects. The failed
+	// insert must leave every index untouched, even if the caller carries
+	// on and commits the transaction.
+	obj2 := &TestObject{
+		ID:  "my-object",
+		Foo: "",
+		Qux: []string{"xyz1", "xyz2"},
+	}
+	txn = db.Txn(true)
+	err = txn.Insert("main", obj2)
+	if err == nil {
+		t.Fatalf("should err")
+	}
+	txn.Commit()
+
+	// The original object should still be reachable from every index.
+	txn = db.Txn(false)
+	defer txn.Abort()
+
+	raw, err := txn.First("main", "id", obj.ID)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if raw != obj {
+		t.Fatalf("bad: %#v", raw)
+	}
+
+	raw, err = txn.First("main", "foo", obj.Foo)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if raw != obj {
+		t.Fatalf("bad: %#v", raw)
+	}
+
+	raw, err = txn.First("main", "qux", obj.Qux[0])
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if raw != obj {
+		t.Fatalf("bad: %#v", raw)
+	}
+}
+
+func TestTxn_Insert_FailedInsertNotApplied(t *testing.T) {
+	db := testDB(t)
+
+	// A rejected insert must not be left behind in any index, regardless
+	// of the order the indexes happen to be visited in. Repeat to cover
+	// different map iteration orders.
+	for i := 0; i < 32; i++ {
+		id := fmt.Sprintf("obj-%d", i)
+		obj := &TestObject{
+			ID:  id,
+			Foo: "",
+			Qux: []string{"qux-" + id},
+		}
+		txn := db.Txn(true)
+		err := txn.Insert("main", obj)
+		if err == nil {
+			t.Fatalf("should err")
+		}
+		txn.Commit()
+
+		txn = db.Txn(false)
+		raw, err := txn.First("main", "id", id)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if raw != nil {
+			t.Fatalf("bad: %#v", raw)
+		}
+
+		raw, err = txn.First("main", "qux", "qux-"+id)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if raw != nil {
+			t.Fatalf("bad: %#v", raw)
+		}
+		txn.Abort()
+	}
+}
+
 func TestTxn_First_NonUnique_Multiple(t *testing.T) {
 	db := testDB(t)
 	txn := db.Txn(true)

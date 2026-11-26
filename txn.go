@@ -206,70 +206,121 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 	idTxn := txn.writableIndex(table, id)
 	existing, update := idTxn.Get(idVal)
 
-	// On an update, there is an existing object with the given
-	// primary ID. We do the update by deleting the current object
-	// and inserting the new object.
+	// Compute and validate the index keys for every index before writing
+	// anything. Every error Insert can return is detectable in this first
+	// pass, so a failure leaves all of the table's indexes untouched
+	// instead of partly applied.
+	type indexWrite struct {
+		schema    *IndexSchema
+		ok        bool
+		okExist   bool
+		val       []byte   // key for a single-value index
+		existVal  []byte   // existing key for a single-value index
+		vals      [][]byte // keys for a multi-value index
+		existVals [][]byte // existing keys for a multi-value index
+	}
+	var writesBuf [8]indexWrite
+	writes := writesBuf[:0]
 	for name, indexSchema := range tableSchema.Indexes {
-		indexTxn := txn.writableIndex(table, name)
+		write := indexWrite{schema: indexSchema}
 
 		// Determine the new index value
 		var (
-			ok   bool
-			vals [][]byte
-			err  error
+			ok  bool
+			err error
 		)
 		switch indexer := indexSchema.Indexer.(type) {
 		case SingleIndexer:
 			var val []byte
 			ok, val, err = indexer.FromObject(obj)
-			vals = [][]byte{val}
+			write.val = val
 		case MultiIndexer:
-			ok, vals, err = indexer.FromObject(obj)
+			ok, write.vals, err = indexer.FromObject(obj)
 		}
 		if err != nil {
 			return fmt.Errorf("failed to build index '%s': %v", name, err)
 		}
+		write.ok = ok
 
 		// Handle non-unique index by computing a unique index.
 		// This is done by appending the primary key which must
 		// be unique anyways.
 		if ok && !indexSchema.Unique {
-			for i := range vals {
-				vals[i] = append(vals[i], idVal...)
+			if _, single := indexSchema.Indexer.(SingleIndexer); single {
+				write.val = append(write.val, idVal...)
+			} else {
+				for i := range write.vals {
+					write.vals[i] = append(write.vals[i], idVal...)
+				}
 			}
 		}
 
-		// Handle the update by deleting from the index first
+		// If there is no index value, either this is an error or an expected
+		// case and we can skip updating
+		if !ok && !indexSchema.AllowMissing {
+			return fmt.Errorf("missing value for index '%s'", name)
+		}
+
+		// On an update, there is an existing object with the given
+		// primary ID. Determine its index values so they can be
+		// deleted in the second pass.
 		if update {
 			var (
-				okExist   bool
-				valsExist [][]byte
-				err       error
+				okExist bool
+				err     error
 			)
 			switch indexer := indexSchema.Indexer.(type) {
 			case SingleIndexer:
 				var valExist []byte
 				okExist, valExist, err = indexer.FromObject(existing)
-				valsExist = [][]byte{valExist}
+				write.existVal = valExist
 			case MultiIndexer:
-				okExist, valsExist, err = indexer.FromObject(existing)
+				okExist, write.existVals, err = indexer.FromObject(existing)
 			}
 			if err != nil {
 				return fmt.Errorf("failed to build index '%s': %v", name, err)
 			}
-			if okExist {
-				for i, valExist := range valsExist {
+			write.okExist = okExist
+		}
+		writes = append(writes, write)
+	}
+
+	// Apply the index writes. Nothing in this pass can fail, so the
+	// insert is applied to all of the table's indexes or none of them.
+	for _, write := range writes {
+		indexTxn := txn.writableIndex(table, write.schema.Name)
+
+		_, single := write.schema.Indexer.(SingleIndexer)
+
+		// Handle the update by deleting from the index first
+		if update && write.okExist {
+			// If we are writing to the same index with the same value,
+			// we can avoid the delete as the insert will overwrite the
+			// value anyways.
+			if single {
+				valExist := write.existVal
+				// Handle non-unique index by computing a unique index.
+				// This is done by appending the primary key which must
+				// be unique anyways.
+				if !write.schema.Unique {
+					valExist = append(valExist, idVal...)
+				}
+				if !bytes.Equal(valExist, write.val) {
+					indexTxn.Delete(valExist)
+				}
+			} else {
+				for i, valExist := range write.existVals {
 					// Handle non-unique index by computing a unique index.
 					// This is done by appending the primary key which must
 					// be unique anyways.
-					if !indexSchema.Unique {
+					if !write.schema.Unique {
 						valExist = append(valExist, idVal...)
 					}
 
 					// If we are writing to the same index with the same value,
 					// we can avoid the delete as the insert will overwrite the
 					// value anyways.
-					if i >= len(vals) || !bytes.Equal(valExist, vals[i]) {
+					if i >= len(write.vals) || !bytes.Equal(valExist, write.vals[i]) {
 						indexTxn.Delete(valExist)
 					}
 				}
@@ -278,17 +329,17 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 
 		// If there is no index value, either this is an error or an expected
 		// case and we can skip updating
-		if !ok {
-			if indexSchema.AllowMissing {
-				continue
-			} else {
-				return fmt.Errorf("missing value for index '%s'", name)
-			}
+		if !write.ok {
+			continue
 		}
 
 		// Update the value of the index
-		for _, val := range vals {
-			indexTxn.Insert(val, obj)
+		if single {
+			indexTxn.Insert(write.val, obj)
+		} else {
+			for _, val := range write.vals {
+				indexTxn.Insert(val, obj)
+			}
 		}
 	}
 	if txn.changes != nil {

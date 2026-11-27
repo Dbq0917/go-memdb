@@ -22,6 +22,11 @@ The database provides the following:
   UUID can be efficiently compressed from strings into byte indexes for reduced
   storage requirements.
 
+* Online Index Addition - Indexes can be added to existing tables at runtime with
+  `AddIndex`, without rebuilding the database. The new index is backfilled from
+  existing records while reads keep flowing; queries against the new index fail
+  with `ErrIndexNotReady` until the backfill completes.
+
 * Watches - Callers can populate a watch set as part of a query, which can be used to
   detect when a modification has been made to the database which affects the query
   results. This lets callers easily watch for changes in the database in a very general

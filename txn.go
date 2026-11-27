@@ -7,8 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
-	"sync/atomic"
-	"unsafe"
 
 	iradix "github.com/hashicorp/go-immutable-radix"
 )
@@ -34,6 +32,7 @@ type Txn struct {
 	db      *MemDB
 	write   bool
 	rootTxn *iradix.Txn
+	schema  *DBSchema
 	after   []func()
 
 	// changes is used to track the changes performed during the transaction. If
@@ -150,7 +149,7 @@ func (txn *Txn) Commit() {
 
 	// Update the root of the DB
 	newRoot := txn.rootTxn.CommitOnly()
-	atomic.StorePointer(&txn.db.root, unsafe.Pointer(newRoot))
+	txn.db.setState(&dbState{schema: txn.schema, root: newRoot})
 
 	// Now issue all of the mutation updates (this is safe to call
 	// even if mutation tracking isn't enabled); we do this after
@@ -186,7 +185,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 	}
 
 	// Get the table schema
-	tableSchema, ok := txn.db.schema.Tables[table]
+	tableSchema, ok := txn.schema.Tables[table]
 	if !ok {
 		return fmt.Errorf("invalid table '%s'", table)
 	}
@@ -310,7 +309,7 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 	}
 
 	// Get the table schema
-	tableSchema, ok := txn.db.schema.Tables[table]
+	tableSchema, ok := txn.schema.Tables[table]
 	if !ok {
 		return fmt.Errorf("invalid table '%s'", table)
 	}
@@ -398,7 +397,7 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 		return false, fmt.Errorf("failed kvs lookup: %s", err)
 	}
 	// Get the table schema
-	tableSchema, ok := txn.db.schema.Tables[table]
+	tableSchema, ok := txn.schema.Tables[table]
 	if !ok {
 		return false, fmt.Errorf("invalid table '%s'", table)
 	}
@@ -659,7 +658,7 @@ func (txn *Txn) LongestPrefix(table, index string, args ...interface{}) (interfa
 // prefix iteration.
 func (txn *Txn) getIndexValue(table, index string, args ...interface{}) (*IndexSchema, []byte, error) {
 	// Get the table schema
-	tableSchema, ok := txn.db.schema.Tables[table]
+	tableSchema, ok := txn.schema.Tables[table]
 	if !ok {
 		return nil, nil, fmt.Errorf("invalid table '%s'", table)
 	}
@@ -675,6 +674,13 @@ func (txn *Txn) getIndexValue(table, index string, args ...interface{}) (*IndexS
 	indexSchema, ok := tableSchema.Indexes[index]
 	if !ok {
 		return nil, nil, fmt.Errorf("invalid index '%s'", index)
+	}
+
+	// An index that is still being backfilled by AddIndex cannot serve
+	// queries yet: its tree is incomplete and would return partial results.
+	// Fail loudly instead of returning empty results.
+	if _, ok := tableSchema.pending[index]; ok {
+		return nil, nil, fmt.Errorf("index '%s' on table '%s': %w", index, table, ErrIndexNotReady)
 	}
 
 	// Hot-path for when there are no arguments
@@ -1011,6 +1017,7 @@ func (txn *Txn) Snapshot() *Txn {
 	snapshot := &Txn{
 		db:      txn.db,
 		rootTxn: txn.rootTxn.Clone(),
+		schema:  txn.schema,
 	}
 
 	// Commit sub-transactions into the snapshot

@@ -47,6 +47,11 @@ type TableSchema struct {
 	// is a unique name for the index and must match the Name in the
 	// IndexSchema.
 	Indexes map[string]*IndexSchema
+
+	// pending tracks indexes that have been registered via AddIndex but
+	// whose backfill from existing records has not completed yet. Queries
+	// against a pending index fail with ErrIndexNotReady.
+	pending map[string]struct{}
 }
 
 // Validate is used to validate the table schema
